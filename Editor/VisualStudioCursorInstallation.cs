@@ -22,6 +22,17 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		private static readonly IGenerator _generator = new SdkStyleProjectGeneration();
 		internal const string ReuseExistingWindowKey = "cursor_reuse_existing_window";
 
+		// Performance optimization: Cache process workspaces to avoid repeated file I/O
+		private static readonly Dictionary<int, CachedProcessWorkspace> _processWorkspaceCache = new Dictionary<int, CachedProcessWorkspace>();
+		private static DateTime _lastCacheUpdate = DateTime.MinValue;
+		private static readonly TimeSpan CacheTimeout = TimeSpan.FromSeconds(2); // 2 second cache
+
+		private class CachedProcessWorkspace
+		{
+			public string[] Workspaces { get; set; }
+			public DateTime CacheTime { get; set; }
+		}
+
 		public override bool SupportsAnalyzers
 		{
 			get
@@ -502,27 +513,36 @@ namespace Microsoft.Unity.VisualStudio.Editor
 
 		private Process FindRunningCursorWithSolution(string solutionPath)
 		{
+			// Performance optimization: Use more efficient string operations
 			var normalizedTargetPath = solutionPath.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();
 
 #if UNITY_EDITOR_WIN
-			// Keep as is for Windows platform since path already includes drive letter
+		// Keep as is for Windows platform since path already includes drive letter
 #else
 			// Ensure path starts with / for macOS and Linux platforms
-			if (!normalizedTargetPath.StartsWith("/"))
+			if (!normalizedTargetPath.StartsWith("/", StringComparison.Ordinal))
 			{
 				normalizedTargetPath = "/" + normalizedTargetPath;
 			}
 #endif
 
+			// Performance optimization: Clear cache if expired
+			var now = DateTime.Now;
+			if (now - _lastCacheUpdate > CacheTimeout)
+			{
+				_processWorkspaceCache.Clear();
+				_lastCacheUpdate = now;
+			}
+
 			var processes = new List<Process>();
 
 			// Get process name list based on different operating systems
 #if UNITY_EDITOR_OSX
-			processes.AddRange(Process.GetProcessesByName("Cursor"));
-			processes.AddRange(Process.GetProcessesByName("Cursor Helper"));
+		processes.AddRange(Process.GetProcessesByName("Cursor"));
+		processes.AddRange(Process.GetProcessesByName("Cursor Helper"));
 #elif UNITY_EDITOR_LINUX
-			processes.AddRange(Process.GetProcessesByName("cursor"));
-			processes.AddRange(Process.GetProcessesByName("Cursor"));
+		processes.AddRange(Process.GetProcessesByName("cursor"));
+		processes.AddRange(Process.GetProcessesByName("Cursor"));
 #else
 			processes.AddRange(Process.GetProcessesByName("cursor"));
 #endif
@@ -531,7 +551,35 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			{
 				try
 				{
-					var workspaces = ProcessRunner.GetProcessWorkspaces(process);
+					// Performance optimization: Use cached workspaces if available
+					string[] workspaces = null;
+					if (_processWorkspaceCache.TryGetValue(process.Id, out var cached))
+					{
+						// Check if cache is still valid (process might have been restarted)
+						if (now - cached.CacheTime < CacheTimeout)
+						{
+							workspaces = cached.Workspaces;
+						}
+						else
+						{
+							_processWorkspaceCache.Remove(process.Id);
+						}
+					}
+
+					// Only fetch workspaces if not cached
+					if (workspaces == null)
+					{
+						workspaces = ProcessRunner.GetProcessWorkspaces(process);
+						if (workspaces != null)
+						{
+							_processWorkspaceCache[process.Id] = new CachedProcessWorkspace
+							{
+								Workspaces = workspaces,
+								CacheTime = now
+							};
+						}
+					}
+
 					if (workspaces != null && workspaces.Length > 0)
 					{
 						foreach (var workspace in workspaces)
@@ -539,15 +587,16 @@ namespace Microsoft.Unity.VisualStudio.Editor
 							var normalizedWorkspaceDir = workspace.Replace('\\', '/').TrimEnd('/').ToLowerInvariant();
 
 #if UNITY_EDITOR_WIN
-							// Keep as is for Windows platform
+						// Keep as is for Windows platform
 #else
 							// Ensure path starts with / for macOS and Linux platforms
-							if (!normalizedWorkspaceDir.StartsWith("/"))
+							if (!normalizedWorkspaceDir.StartsWith("/", StringComparison.Ordinal))
 							{
 								normalizedWorkspaceDir = "/" + normalizedWorkspaceDir;
 							}
 #endif
 
+							// Performance optimization: Use OrdinalIgnoreCase for case-insensitive comparison
 							if (string.Equals(normalizedWorkspaceDir, normalizedTargetPath, StringComparison.OrdinalIgnoreCase) ||
 								normalizedTargetPath.StartsWith(normalizedWorkspaceDir + "/", StringComparison.OrdinalIgnoreCase) ||
 								normalizedWorkspaceDir.StartsWith(normalizedTargetPath + "/", StringComparison.OrdinalIgnoreCase))
@@ -559,6 +608,8 @@ namespace Microsoft.Unity.VisualStudio.Editor
 				}
 				catch (Exception ex)
 				{
+					// Remove invalid process from cache
+					_processWorkspaceCache.Remove(process.Id);
 					Debug.LogError($"[Cursor] Error checking process: {ex}");
 					continue;
 				}
@@ -566,13 +617,59 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			return null;
 		}
 
+		// Performance optimization: Cache workspace file lookup
+		private static readonly Dictionary<string, CachedWorkspace> _workspaceCache = new Dictionary<string, CachedWorkspace>();
+		private static DateTime _lastWorkspaceCacheUpdate = DateTime.MinValue;
+		private static readonly TimeSpan WorkspaceCacheTimeout = TimeSpan.FromSeconds(5); // 5 second cache
+
+		private class CachedWorkspace
+		{
+			public string Workspace { get; set; }
+			public DateTime CacheTime { get; set; }
+		}
+
 		private static string TryFindWorkspace(string directory)
 		{
-			var files = Directory.GetFiles(directory, "*.code-workspace", SearchOption.TopDirectoryOnly);
-			if (files.Length == 0 || files.Length > 1)
-				return null;
+			// Performance optimization: Use cache if available
+			var now = DateTime.Now;
+			if (now - _lastWorkspaceCacheUpdate > WorkspaceCacheTimeout)
+			{
+				_workspaceCache.Clear();
+				_lastWorkspaceCacheUpdate = now;
+			}
 
-			return files[0];
+			if (_workspaceCache.TryGetValue(directory, out var cached))
+			{
+				if (now - cached.CacheTime < WorkspaceCacheTimeout)
+				{
+					// Verify cached file still exists
+					if (cached.Workspace != null && File.Exists(cached.Workspace))
+					{
+						return cached.Workspace;
+					}
+					if (cached.Workspace == null)
+					{
+						// Cached null result, return null without rechecking
+						return null;
+					}
+				}
+				_workspaceCache.Remove(directory);
+			}
+
+			var files = Directory.GetFiles(directory, "*.code-workspace", SearchOption.TopDirectoryOnly);
+			string workspace = null;
+			if (files.Length == 1)
+			{
+				workspace = files[0];
+			}
+
+			_workspaceCache[directory] = new CachedWorkspace
+			{
+				Workspace = workspace,
+				CacheTime = now
+			};
+
+			return workspace;
 		}
 
 		public override bool Open(string path, int line, int column, string solution)
@@ -584,7 +681,11 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			var application = Path;
 
 			var workspace = TryFindWorkspace(directory);
+#if UNITY_2020_2_OR_NEWER
 			workspace ??= directory;
+#else
+			workspace = workspace ?? directory;
+#endif
 			directory = workspace;
 
 			if (EditorPrefs.GetBool(ReuseExistingWindowKey, false))

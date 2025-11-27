@@ -44,8 +44,12 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		[InitializeOnLoadMethod]
 		static void LegacyVisualStudioCodePackageDisabler()
 		{
-			// disable legacy Visual Studio Code packages
+#if UNITY_2021_1_OR_NEWER
 			var editor = CodeEditor.Editor.GetCodeEditorForPath("code.cmd");
+#else
+			// disable legacy Visual Studio Code packages
+			var editor = CodeEditor.CurrentEditor;
+#endif
 			if (editor == null)
 				return;
 
@@ -83,7 +87,7 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		// keeping it for now given it is public, so we need a major bump to remove it 
 		public void CreateIfDoesntExist()
 		{
-			if (!TryGetVisualStudioInstallationForPath(CodeEditor.CurrentEditorInstallation, true, out var installation)) 
+			if (!TryGetVisualStudioInstallationForPath(CodeEditor.CurrentEditorInstallation, true, out var installation))
 				return;
 
 			var generator = installation.ProjectGenerator;
@@ -138,7 +142,7 @@ namespace Microsoft.Unity.VisualStudio.Editor
 				var newReuseWindow = EditorGUILayout.Toggle(new GUIContent("Reuse existing Cursor window", "When enabled, opens files in an existing Cursor window if found. When disabled, always opens a new window."), reuseWindow);
 				if (newReuseWindow != reuseWindow)
 					EditorPrefs.SetBool(VisualStudioCursorInstallation.ReuseExistingWindowKey, newReuseWindow);
-				
+
 				EditorGUILayout.Space();
 			}
 
@@ -226,7 +230,9 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		{
 			var editorPath = CodeEditor.CurrentEditorInstallation;
 
-			if (!Discovery.TryDiscoverInstallation(editorPath, out var installation)) {
+			// Performance optimization: Use cached installation lookup instead of discovering every time
+			if (!TryGetVisualStudioInstallationForPath(editorPath, lookupDiscoveredInstallations: true, out var installation))
+			{
 				Debug.LogWarning($"Visual Studio executable {editorPath} is not found. Please change your settings in Edit > Preferences > External Tools.");
 				return false;
 			}
@@ -238,7 +244,8 @@ namespace Microsoft.Unity.VisualStudio.Editor
 			if (!IsProjectGeneratedFor(path, generator, out var missingFlag))
 				Debug.LogWarning($"You are trying to open {path} outside a generated project. This might cause problems with IntelliSense and debugging. To avoid this, you can change your .csproj preferences in Edit > Preferences > External Tools and enable {GetProjectGenerationFlagDescription(missingFlag)} generation.");
 
-			var solution = GetOrGenerateSolutionFile(generator);
+			// Performance optimization: Only sync if solution doesn't exist
+			var solution = GetOrGenerateSolutionFileIfNeeded(generator);
 			return installation.Open(path, line, column, solution);
 		}
 
@@ -305,6 +312,16 @@ namespace Microsoft.Unity.VisualStudio.Editor
 		private static string GetOrGenerateSolutionFile(IGenerator generator)
 		{
 			generator.Sync();
+			return generator.SolutionFile();
+		}
+
+		// Performance optimization: Only sync if solution file doesn't exist
+		private static string GetOrGenerateSolutionFileIfNeeded(IGenerator generator)
+		{
+			if (!generator.HasSolutionBeenGenerated())
+			{
+				generator.Sync();
+			}
 			return generator.SolutionFile();
 		}
 	}
